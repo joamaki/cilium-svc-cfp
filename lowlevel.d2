@@ -1,0 +1,152 @@
+
+
+
+seq: "" {
+  fill: "#fefffe"
+  comment: |`markdown
+    # Backend lookup (mode=random)
+    1. Check conntrack and skip lookup if exists
+    2. Lookup master service by `(address, dport)` (proto TBD)
+    3. Lookup "backend slot" service by `random()%backendCount`
+    4. Lookup backend by `backendID` 
+    5. Redirect to packet to `(backend.address, backend.port)`
+
+
+    ### Implementation thoughts
+
+    To avoid packet drops on new connections, this implies that:
+    - Backend entries should exist before services refer to them
+    - Maglev maps should be updated after backends, but before services
+    - "backend slot" services should exist before "master service"
+
+    Do one single "reconciliation update op" that does BPF batch update on \
+    backends and if succeeds another on the services. Hold some state to avoid \
+    unnecessary backend updates since many services may refer to them.
+`|
+}
+
+
+maps: "BPF Maps"
+
+maps.services: "Services (IPv4)" {
+  shape: class
+
+  # Misusing the notation here a bit.
+
+  \# Key
+  - address: IPv4
+  - port: uint16
+  - backendSlot: uint16
+  - proto: uint8
+  - scope: uint8
+  
+  \# Value
+  - backendID: uint32
+  - backendCount: uint16
+  - revNatIndex: uint16
+  - flags: uint16
+}
+
+maps.services -> maps.backends: "backendID (mode=random)" {}
+
+maps.backends: "Backends" {
+  shape: class
+  
+  \# Key
+  - id: uint16
+
+  \# Value
+  - address: IPv4
+  - port: uint16
+  - proto: U8proto
+  - flags: uint8
+}
+
+maps.maglev_inner: "Maglev Inner (IPv4)" {
+  shape: class
+
+  - backendIDs: "[]uint32"
+}
+
+maps.maglev_outer: "Maglev Outer (IPv4)" {
+  shape: class
+
+  \# Key
+  - revNatIndex: uint16
+
+  \# Value
+  - FD: uint32
+}
+
+maps.maglev_inner -> maps.backends: "backendID (mode=maglev)" {}
+maps.maglev_outer -> maps.maglev_inner: "FD (map-in-map)" {}
+maps.services -> maps.maglev_outer: "revNatIndex" {}
+
+maps.affinity: Affinity {
+  shape: class
+  
+  \# Key
+  - clientID: "uint64 (saddr)"
+  - revNatIndex: uint16
+  - netNSCookie: uint8
+
+  \# Value
+  - lastUsed: uint64
+  - backendID: uint32
+}
+
+maps.services -> maps.affinity: "(saddr, revNatIndex, cookie)" {}
+
+maps.affinity -> maps.backends: "backendID" {}
+
+maps.revnat: "ReverseNat (IPv4)" {
+  shape: class
+
+  \# Key
+  - cookie: uint64
+  - address: IPv4
+  - port: int16
+
+  \# Value
+  - address: IPv4
+  - port: int16
+  - revNatIndex: uint16
+}
+
+maps.revnat -> maps.services: "(address, port) + revNatIndex eq?" {}
+
+
+flags.comment -> maps.services: {
+  style.stroke-dash: 4
+  style.stroke: "#000E3D"
+}
+
+flags: "" {
+  fill: "#fefffe"
+  comment: |`markdown
+    # Flags
+    - ExternalIPs
+    - NodePort
+    - HostPort
+    - SessionAffinity
+    - LoadBalancer
+    - Routable
+    - SourceRange
+    - LocalRedirect
+    - Nat46x64
+    - L7LoadBalancer
+    - Loopback
+    - ExtLocalScope
+    - IntLocalScope
+    - TwoScopes
+
+    ## Notes
+
+    One K8s service expands to many BPF services, e.g. one per type per frontend IP.
+
+    What's interesting here are the `LocalRedirect` and `L7LoadBalancer` flags \
+    that redirect packets to somewhere else than the backends. These are sort of \
+    overrides on top of the normal service and may come and go.
+`|
+}  
+

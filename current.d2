@@ -1,0 +1,134 @@
+
+k8s: "Kubernetes" {}
+
+k8s.service: "Service" {
+  shape: class
+}
+
+k8s.endpointSlice: "EndpointSlice" {
+  shape: class
+}
+
+k8s.pod: "Pod" {
+  shape: class
+}
+k8s.pod -> serviceManager: "(HostPort)"
+
+k8s.ciliumLRP: "CiliumLocalRedirectPolicy" {
+  shape: class
+}
+k8s.ciliumLRP -> redirectPolicyManager
+
+k8s.ciliumEnvoyConfig: "Cilium(Clusterwide)EnvoyConfig" {
+  shape: class
+}
+k8s.ciliumEnvoyConfig -> serviceManager: "redirect service to L7 proxy"
+
+api: "Cilium REST API" {}
+
+api.services: "PUT /service/{id}" {}
+
+api.services -> serviceManager
+
+kvstore: "KVStore" {}
+
+kvstore.ClusterService: "ClusterService" {
+
+}
+kvstore.ClusterService -> serviceCache: "(merge backends from other clusters)"
+
+k8s.service -> serviceCache
+k8s.endpointSlice -> serviceCache
+
+serviceCache: "ServiceCache" {
+  shape: class
+
+  - services: "map[ServiceID]*Service"
+  - endpoints: "map[ServiceID]*EndpointSlices"
+  Events: "chan ServiceEvent"
+}
+
+serviceCache.Events -> k8sServiceHandler: "ServiceEvent"
+
+k8sServiceHandler: "K8sServiceHandler" {
+  comment: |`markdown
+    Processes ServiceEvents from ServiceCache. \
+    Service is exploded by type and frontend IP to many 'SVC' structs \
+    and passed to ServiceManager. Also updates CIDR identities.
+`|
+}
+
+# NodeAddressing -> serviceCache: "NodePort frontend IP addresses"
+
+k8sServiceHandler -> serviceManager: "[]SVC"
+
+serviceManager -> bpf.services
+serviceManager -> bpf.backends
+
+serviceManager: "ServiceManager" {
+  shape: class
+  - svcByHash: "map[string]*svcInfo"
+  - svcByID: "map[ID]*svcInfo"
+  - backendByHash: "map[string]*lb.Backend"
+  - l7lbSvcs: "map[ServiceName]*L7LBInfo"
+}
+
+serviceManager -> l7proxy: "Sync backends to Envoy"
+
+redirectPolicyManager: "RedirectPolicyManager"
+
+redirectPolicyManager -> serviceCache: "EnsureService() to restore original service"
+redirectPolicyManager -> serviceManager: "LocalRedirect Service"
+
+serviceCache -> redirectPolicyManager: "GetService*"
+
+l7proxy: "L7 proxy"
+
+bpf.services: "lb4_services_v2" {
+  shape: "cylinder"
+}
+bpf.backends: "lb4_backends_v3" {
+  shape: "cylinder"
+}
+
+bgp: "BGP"
+serviceCache -> bgp: "GetEndpointsOfService"
+
+clustermesh: "ClusterMesh"
+serviceCache -> clustermesh: "GetServiceIP for etcd dialer"
+
+serviceCache -> kvstore: "GetServiceIP for etcd dialer"
+
+note: "" {
+  fill: "#fefffe"
+  comment: |`markdown 
+    # Notes
+
+    This shows roughly the current state of how the service load-balancing \
+    control-plane works. There's major problems with it:
+
+    - Expansion of NodePort frontend IPs is done when parsing K8s Service to internal presentation \
+      which is problematic with node IP address changes and it exposes low-level datapath details \
+      to upper layers. `pkg/service/reconciler.go` tries to fix things up. 
+
+    - It is difficult to hook into service-related data and to watch for changes. \
+      Currently done via ad-hoc callbacks and methods in `ServiceManager` and `ServiceCache`.
+
+    - It is difficult to consolidate and to restore services when there is overlap. \
+      E.g. if a LocalRedirectPolicy or L7 redirect is removed the original service should \
+      be restored (see EnsureService hack). For services added via REST API there's no mechanism \
+      to fix things up.
+
+    - Timing issues with e.g. `ServiceCache` `Get*` API. For example `RedirectPolicyManager` looks up \
+      from `ServiceCache` when processing `CiliumLocalRedirectPolicy`, but it may do the lookups \
+      at the wrong time. These sort of issues are worked around with hacks (RedirectPolicyManager.OnAddService), \
+      which are fragile and require synchronous processing and correct ordering.
+
+    - Poor performance (in recent benchmark ~8k services/s, not counting BPF syscalls)
+
+    - Very difficult to correctly add new sources for services, especially if the new source needs
+      to deal with overlaps.
+`|
+}
+
+

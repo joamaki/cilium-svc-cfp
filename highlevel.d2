@@ -1,0 +1,110 @@
+
+k8s: "Kubernetes" {}
+
+k8s.service: "Service" {
+  shape: class
+}
+k8s.service -> Service: "one to many"
+
+k8s.endpointSlice: "EndpointSlice" {
+  shape: class
+}
+k8s.endpointSlice -> Service: "backends for service"
+
+k8s.pod: "Pod" {
+  shape: class
+}
+k8s.pod -> Service: "(HostPort)"
+
+k8s.ciliumLRP: "CiliumLocalRedirectPolicy" {
+  shape: class
+}
+k8s.ciliumLRP -> Service: "redirect service to local backend"
+
+
+k8s.ciliumEnvoyConfig: "Cilium(Clusterwide)EnvoyConfig" {
+  shape: class
+}
+k8s.ciliumEnvoyConfig -> Service: "redirect traffic to L7 proxy"
+
+api: "Cilium REST API" {}
+
+api.services: "PUT /service/{id}" {}
+
+api.services -> Service
+
+kvstore: "KVStore" {}
+
+kvstore.ClusterService: "ClusterService" {
+  shape: class
+}
+
+kvstore.ClusterService -> Service: "(merge backends from other clusters)"
+
+maps: "BPF maps" {
+  shape: "cylinder"
+}
+
+maps -> Service: "restore services from BPF"
+Service -> maps: "reconcile BPF maps"
+
+#tables: "Control-plane tables" {}
+
+Service: "Service" {
+  shape: sql_table
+
+  address: netip.Addr {constraint: primary_key}
+  port: uint16 {constraint: primary_key}
+  proto: L4Proto {constraint: primary_key}
+
+  id: uint32 {constraint: unique}
+ 
+  namespace, name, cluster: string {constraint: unique}
+
+  # Other services (with different type) that overlap with the (address,port,proto).
+  # These remain "shadowed" until this service goes away.
+  # Unclear though whether they should be maintained at this level or a level
+  # above. Doing it this way allows for a bit more flexibility as the services
+  # can be ingested at different times and a higher-priority one can come later
+  # to replace lower-priority one and when removed the lower-priority one can be
+  # restored. OTOH, we might want to tell the user that there's a conflict.
+  shadowed: "[]*Service"
+
+  # Sources that have contributed to this service, e.g. "K8s", "API", "kvstore", ...
+  # Used as a rudimentary reference count mechanism.
+  sources: "[]string"
+
+  # Service type, e.g. NodePort, LoadBalancer and so on.
+  type: Type
+
+  # Glossing over the details of these.
+  trafficPolicy: TrafficPolicy
+  sessionAffinity: SessionAffinity
+  healthCheck: HealthCheck
+  natPolicy: NatPolicy
+
+  l7ProxyPort: uint16
+
+  # References to backends. A separate backend table exists for mostly deduplication and
+  # inspection purposes. Reconciliation would work off of these.
+  backends: "[]*Backend"
+
+  # Reconciliation status for the services/backends/etc. BPF maps.
+  status: reconciler.Status
+}
+
+Service.backends -> Backend: "backend deduplication"
+
+Backend: "Backend" {
+  shape: sql_table
+
+  address: netip.Addr {constraint: primary_key}
+  port: uint16 {constraint: primary_key}
+  proto: L4Proto {constraint: primary_key}
+
+  id: uint32
+
+  # The number of services referencing this backend.
+  refCount: int
+}
+
