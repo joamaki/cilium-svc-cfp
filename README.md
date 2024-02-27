@@ -67,6 +67,30 @@ _Describe crucial impacts and key questions that likely require discussion and d
 TODO define the lifetime of how a service can evolve and work through the different
 scenarios when multiple data sources interact/overlap with a service.
 
+#### Overrides
+
+Currently L7 proxy redirection and LocalRedirectPolicy are the main things that
+"augment" an existing service that has come from another data source. The implementation
+must be such that e.g. LocalRedirectPolicy can be applied to a service before other details
+for the service arrive and that if a LocalRedirectPolicy is removed the original service is
+restored.
+
+#### Backend merging
+
+The other interaction across data sources on a single service is the merging of backends
+from other Cilium clusters via ClusterMesh. These are stored as "ClusterServices" in etcd
+and are merged with existing services of the local cluster to add the backends in the other
+clusters to it. The implementation must be able to deal with adding backends to a service
+before the service frontend details arrive. It must also be possible to manipulate backends
+based on its source (e.g. to remove all backends that came from a specific data source).
+
+This likely implies that the information on how a backend maps to a service should be stored
+in a separate "backend" table to allow services to come and go independent of the backends
+associated with them. E.g. backends are first added to a backend table after which the
+services that the new backends refer to are updated to refer to the new set of backends
+([demo app](https://github.com/cilium/cilium/pull/30036/files#diff-888b31f33198e7ac2cfc535e0903c2e588d1e80e0fcb7f566cdbaa701642c01cR66)
+shows how this can be implemented).
+
 ### Key Question: Reconciliation of "Service"
 
 TODO can the reconciliation of the BPF maps (services, backends, maglev, etc.) be correctly and efficiently
