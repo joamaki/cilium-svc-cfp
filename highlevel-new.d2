@@ -1,0 +1,159 @@
+Service: "Service" {
+  shape: sql_table
+  serviceID: ServiceID {constraint: unique}
+
+  # Sources that have contributed to this service, e.g. "K8s", "API", "kvstore", ...
+  source: "k8s | kvstore | restapi | ..."
+
+  properties: Props
+
+  "(...)": "(fields omitted)"
+
+  frontends: "Map[L3n4Addr, Frontend]"
+  backendRevision: statedb.Revision
+  status: reconciler.Status
+}
+
+Frontend: "Frontend" {
+  shape: class
+  address: L3n4Addr {constraint: primary_key}
+  source: "k8s | kvstore | restapi | ..."
+  bpf_id: uint32 {constraint: unique}
+  type: SVCType
+}
+
+Frontend -> Service: "(embedded)"
+
+Backend: "Backend" {
+  shape: sql_table
+  address: L3n4Addr {constraint: primary_key}
+  services: "[]ServiceID" {constraint: foreign_key}
+  state: "Active | Maintenance | Terminating | ..."
+  bpf_id: uint32
+}
+
+Backend -> Service: "1-to-many"
+Service -> Backend: "(backlink via backendRevision)"
+
+
+usecases: |md
+  # Use-cases
+
+  ## Data ingestion 
+
+  The ingestion should happen in small batches to amortize the cost of StateDB WriteTxn \
+  and the cost of context switching (each commit will notify watchers and the more we \
+  do in one batch the less wakeups we have).
+
+  ### k8s.Service
+  - With a batch of updated/deleted Service objects do a ServiceWriteTxn
+  - Modify or create the Service object, retaining "stateful" fields such \
+    as properties or "l7proxyPort" (we likely want type-level split of these). \
+    Mark object as pending for reconciliation.
+  - Commit
+  
+  ### k8s.EndpointSlice
+  Since we have separate Service and Backend tables we can process EndpointSlices separately \
+  from the Services and do not need the correlation at this phase as done by ServiceCache.
+
+  - Insert each (serviceID, address, port) as Backends
+  - Bump Service backendRevision and mark reconciliation as pending for each referenced service
+
+  ### cm.ClusterService
+  A ClusterService describes a service (frontends&backends) in another cluster. A ClusterService is \
+  a subset of (k8s) Service. Services are identified by the (name, namespace, cluster) tuple and hence\
+  these do not overlap with services from local cluster. However, the backends in remote clusters are\
+  merged with services in the local cluster with same (name, namespace).
+
+  See ServiceCache.Merge* and correlateEndpoints() for current semantics.
+
+  TBD, but since the remote cluster Service itself does not overlap with local services of same (name, namespace), \
+  is it enough to just index backends in such a way that in reconciliation we can easily lookup both\
+  the local & remote backends?
+
+  ### REST API
+  Current REST API is an "unsupported" way of configuring the load-balancing. Some use-cases exist that use \
+  Cilium as a standalone load-balancer without K8s, but currently there are no plans to have stable support for\
+  this. We should still keep this in some form, but can likely modify the REST API (api/v1/openapi.yaml) as needed.
+
+  Main detail to figure out is how the API addresses services. Currently it works directly with the BPF integer\
+  identities which is problematic for this proposal and also for at least one user that uses this API. Should move\
+  towards L3n4Addr as the key.
+
+  ## BPF map reconciliation
+
+  In order to guarantee consistent view in the BPF state a single sequential reconciler is used \
+  to perform the updates to the BPF maps. The reconciler works on a single Service object at a \
+  time and performs a query for the associated backends. The backends are shared among multiple \
+  Services, but the reconciliation is still performed as part of the Service reconciliation. \
+  Reference counting is employed to track when a backend becomes unreferenced and can be removed. \
+  Duplicate updates are avoided by keeping track of what BPF updates were performed. 
+
+  - Reconciler observers upserts and deletions to Table[Service]
+  - Update of Service:
+    1. Allocate BPF identifier (uint32) for every new Frontend. Set ID in Frontend (debug aid).
+    2. Lookup associated backends by service ID
+    3. Update secondary BPF maps in correct order: backends, maglev, ...
+    4. Update services BPF map for each Frontend, first slots and then master entry
+  - Delete of Service:
+    1. Delete service master and secondary slots
+    2. Delete maglev etc. entries
+    3. Decrease refcount of all backends referencing the service
+    4. Delete orphan backends
+
+  ## L7 redirection
+  Two scenarios: 1) CiliumEnvoyConfig seen first, 2) Service seen first. \
+  We want to mark the L7 redirect before reconciliation to avoid misrouting. \
+  All further updates to Service must retain the L7 redirection settings.
+
+  1) CiliumEnvoyConfig is first
+  - L7 registers a Service upsert hook
+  - On Service upsert the hook is called and CiliumEnvoyConfigs are consulted
+    to set the L7ProxyPort.
+
+  2) Service is first
+  - Service is inserted into Table[Service]
+  - Hook called, no matching CiliumEnvoyConfig
+  - CiliumEnvoyConfig is created
+  - "L7 service controller" processes the CiliumEnvoyConfig and looks up
+    each matching service and sets L7ProxyPort.
+
+  An alternative to this hook and controller approach would be to make the Services API stateful\
+  and allow registering this as a state that the Services API itself reconciles, e.g. we'd have\
+  `map[ServiceID]L7ProxyPort` essentially.
+
+  ## Local redirection
+  Similar to L7 redirection. Main difference is that instead of a single port to redirect traffic\
+  we have a set of backends. Current implementation creates a secondary service with "-local" suffix\
+  and has special casing for this. Perhaps this can be implemented similarly, with backends referencing\
+  services with the "-local" suffix and the service having a "LocalRedirect bool" that flips the lookup.
+  Important to be able to set and unset the local redirection on a service, and as with L7 to be able to
+  implement this in a way that works regardless of the order in which Service and LocalRedirectPolicy are
+  observed (hook + controller?).
+  
+  ## Service IP lookup
+
+  A somewhat special case in bootstrapping where we need to look up the frontend IP for the kvstore\
+  etcd server. Should just be a lookup into Table[Service] with the service name and then pick from\
+  the frontends. Need to be able to wait for Table[Service] to be initialized (table initializers?).
+  
+  ## Service metadata lookup
+
+  TODO figure out what current uses for e.g. Resource[Service] etc. exist in the agent and what is\
+  being done with the object (LBIPAM, BGP, ???).
+
+  ## Restoration
+
+  TODO figure out what we need to restore from BPF maps and how. At least known cases are the reuse
+  of the BPF integer identifiers and old state to avoid connection disruption, and restoration of
+  entries created via REST API (do we need it?).
+
+  ## External health checking
+  An external health-check implementation surfaces the backend health and marks failing
+  backends as unavailable.
+
+  1. On a batch of health updates do a ServiceWriteTxn
+  2. Look up each backend and update state accordingly
+  3. Mark each service referenced from backends for reconciliation
+   
+| {near: center-right}
